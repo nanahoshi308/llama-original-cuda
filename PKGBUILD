@@ -7,15 +7,15 @@ arch=('x86_64')
 url="https://github.com/ggml-org/llama.cpp"
 license=('MIT')
 depends=('cuda' 'curl')
-makedepends=('cmake' 'git' 'patchelf')
+makedepends=('cmake' 'git' 'npm' 'patchelf')
 provides=('llama-cpp')
 conflicts=('llama-cpp-cuda')
 options=('!strip')
 source=("${pkgname}::git+https://github.com/ggml-org/llama.cpp.git"
         "vram-gpu-schedule.patch"
-#	"fix-mcp-override-fallback.patch"
+        "fix-mcp-override-fallback.patch"
     )
-sha256sums=('SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 pkgver() {
     cd "${srcdir}/${pkgname}"
@@ -25,7 +25,7 @@ pkgver() {
 prepare() {
     cd "${srcdir}/${pkgname}"
     patch -p1 < "${srcdir}/vram-gpu-schedule.patch"
-#    patch -p1 < "${srcdir}/fix-mcp-override-fallback.patch"
+    patch -p1 < "${srcdir}/fix-mcp-override-fallback.patch"
 }
 
 build() {
@@ -34,7 +34,8 @@ build() {
         -DCMAKE_CUDA_ARCHITECTURES="75;89" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr \
-        -DLLAMA_BUILD_TESTS=OFF
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_USE_PREBUILT_UI=OFF
     cmake --build "${srcdir}/build" --target llama-server -j$(nproc)
 }
 
