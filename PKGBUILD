@@ -1,6 +1,6 @@
 # Maintainer: local build
 pkgname=llama-cpp-cuda
-pkgver=r9994.14d3ba45f3
+pkgver=r10001.657e01125a
 pkgrel=1
 pkgdesc="LLM inference in C/C++ with CUDA (local build)"
 arch=('x86_64')

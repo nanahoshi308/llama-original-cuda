@@ -1,4 +1,4 @@
 src
 pkg
 llama-cpp-cuda
-*.pkg.zst
+*.pkg.tar.zst
