@@ -1,0 +1,196 @@
+diff --git a/tools/ui/src/lib/stores/conversations.svelte.ts b/tools/ui/src/lib/stores/conversations.svelte.ts
+index ea2c11e14..49e6eaff6 100644
+--- a/tools/ui/src/lib/stores/conversations.svelte.ts
++++ b/tools/ui/src/lib/stores/conversations.svelte.ts
+@@ -621,28 +621,33 @@ class ConversationsStore {
+ 
+ 	/**
+ 	 * Gets MCP server override for a specific server in the active conversation.
+-	 * Falls back to `mcpServers[i].enabled` if no active conversation exists.
++	 * Falls back to `mcpServers[i].enabled` whenever the active conversation has no
++	 * explicit override for this server -- including when there is no active
++	 * conversation yet, and when a conversation exists but was never toggled
++	 * (e.g. immediately after the first message creates it).
+ 	 * @param serverId - The server ID to check
+ 	 * @returns The override if set, undefined if no matching server
+ 	 */
+ 	getMcpServerOverride(serverId: string): McpServerOverride | undefined {
+-		if (this.activeConversation) {
+-			return this.activeConversation.mcpServerOverrides?.find(
+-				(o: McpServerOverride) => o.serverId === serverId
+-			);
+-		}
++		const explicitOverride = this.activeConversation?.mcpServerOverrides?.find(
++			(o: McpServerOverride) => o.serverId === serverId
++		);
++		if (explicitOverride) return explicitOverride;
+ 		return this.#getDefaultOverrideForNoConversation(serverId);
+ 	}
+ 
+ 	/**
+-	 * Get all MCP server overrides for the current conversation.
+-	 * When no active conversation, derives from `mcpServers[i].enabled`.
++	 * Get all MCP server overrides for the current conversation, merged with
++	 * `mcpServers[i].enabled` defaults for any server without an explicit
++	 * per-conversation override (see [[getMcpServerOverride]]).
+ 	 */
+ 	getAllMcpServerOverrides(): McpServerOverride[] {
+-		if (this.activeConversation?.mcpServerOverrides) {
+-			return this.activeConversation.mcpServerOverrides;
+-		}
+-		return this.#getAllDefaultOverridesForNoConversation();
++		const explicitOverrides = this.activeConversation?.mcpServerOverrides ?? [];
++		const explicitServerIds = new Set(explicitOverrides.map((o: McpServerOverride) => o.serverId));
++		const defaultOverrides = this.#getAllDefaultOverridesForNoConversation().filter(
++			(o) => !explicitServerIds.has(o.serverId)
++		);
++		return [...explicitOverrides, ...defaultOverrides];
+ 	}
+ 
+ 	/**
+diff --git a/tools/ui/tests/unit/conversations-mcp-override.spec.ts b/tools/ui/tests/unit/conversations-mcp-override.spec.ts
+new file mode 100644
+index 000000000..cb49adf19
+--- /dev/null
++++ b/tools/ui/tests/unit/conversations-mcp-override.spec.ts
+@@ -0,0 +1,140 @@
++import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++
++// Regression test for: MCP server toggle flips from "on" to "off" right after
++// the first message in a brand-new chat triggers conversation creation.
++//
++// Root cause: once `activeConversation` exists, `getMcpServerOverride` only
++// looked at `activeConversation.mcpServerOverrides`, and never fell back to
++// the global `mcpServers[i].enabled` default when that array had no entry
++// for the server -- even though a freshly created conversation intentionally
++// has no per-conversation overrides seeded (see `createConversation`).
++
++vi.mock('$app/navigation', () => ({
++	goto: vi.fn()
++}));
++
++vi.mock('$app/environment', () => ({
++	browser: false
++}));
++
++vi.mock('svelte-sonner', () => ({
++	toast: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }
++}));
++
++vi.mock('$lib/services/migration.service', () => ({
++	MigrationService: {}
++}));
++
++vi.mock('$lib/services/router.service', () => ({
++	RouterService: { chat: vi.fn(() => '/chat/mock') }
++}));
++
++vi.mock('$lib/stores/settings.svelte', () => ({
++	config: vi.fn(() => ({}))
++}));
++
++const createConversationMock = vi.fn();
++const updateConversationMock = vi.fn();
++
++vi.mock('$lib/services/database.service', () => ({
++	DatabaseService: {
++		createConversation: (...args: unknown[]) => createConversationMock(...args),
++		updateConversation: (...args: unknown[]) => updateConversationMock(...args)
++	}
++}));
++
++const getServersMock = vi.fn();
++const updateServerMock = vi.fn();
++
++vi.mock('$lib/stores/mcp.svelte', () => ({
++	mcpStore: {
++		getServers: (...args: unknown[]) => getServersMock(...args),
++		updateServer: (...args: unknown[]) => updateServerMock(...args)
++	}
++}));
++
++const MCP_SERVER_ON = {
++	id: 'server-on',
++	url: 'http://on.example',
++	enabled: true,
++	requestTimeoutSeconds: 30
++};
++const MCP_SERVER_OFF = {
++	id: 'server-off',
++	url: 'http://off.example',
++	enabled: false,
++	requestTimeoutSeconds: 30
++};
++
++describe('conversationsStore MCP per-chat override fallback', () => {
++	let conversationsStore: (typeof import('$lib/stores/conversations.svelte'))['conversationsStore'];
++
++	beforeAll(async () => {
++		({ conversationsStore } = await import('$lib/stores/conversations.svelte'));
++	}, 120000);
++
++	beforeEach(() => {
++		vi.clearAllMocks();
++		getServersMock.mockReturnValue([MCP_SERVER_ON, MCP_SERVER_OFF]);
++	});
++
++	it('falls back to the global enabled flag before any conversation exists', () => {
++		conversationsStore.activeConversation = null;
++
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_ON.id)).toBe(true);
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_OFF.id)).toBe(false);
++	});
++
++	it('keeps the global default once the first message creates the conversation', async () => {
++		conversationsStore.activeConversation = null;
++
++		// Simulate what DatabaseService.createConversation() returns: a brand-new
++		// conversation with no mcpServerOverrides, exactly as chat.svelte.ts's
++		// sendMessage() triggers on the very first message of a new chat.
++		createConversationMock.mockResolvedValue({
++			id: 'conv-1',
++			name: 'New chat',
++			lastModified: Date.now(),
++			currNode: ''
++		});
++		updateConversationMock.mockResolvedValue(undefined);
++
++		await conversationsStore.createConversation();
++
++		expect(conversationsStore.activeConversation?.id).toBe('conv-1');
++		expect(conversationsStore.activeConversation?.mcpServerOverrides).toBeUndefined();
++
++		// This is the regression: previously this returned false because
++		// getMcpServerOverride() stopped falling back once activeConversation
++		// was non-null, regardless of whether an explicit override existed.
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_ON.id)).toBe(true);
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_OFF.id)).toBe(false);
++	});
++
++	it('an explicit per-chat override still takes precedence over the global default', () => {
++		conversationsStore.activeConversation = {
++			id: 'conv-2',
++			name: 'Existing chat',
++			lastModified: Date.now(),
++			currNode: '',
++			mcpServerOverrides: [{ serverId: MCP_SERVER_ON.id, enabled: false }]
++		};
++		conversationsStore.conversations = [conversationsStore.activeConversation];
++		updateConversationMock.mockResolvedValue(undefined);
++
++		// Explicit override says "off" even though the global default is "on".
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_ON.id)).toBe(false);
++		// The other server has no explicit override, so it still falls back to
++		// its (disabled) global default.
++		expect(conversationsStore.isMcpServerEnabledForChat(MCP_SERVER_OFF.id)).toBe(false);
++
++		const all = conversationsStore.getAllMcpServerOverrides();
++		expect(all).toEqual(
++			expect.arrayContaining([
++				{ serverId: MCP_SERVER_ON.id, enabled: false },
++				{ serverId: MCP_SERVER_OFF.id, enabled: false }
++			])
++		);
++		expect(all).toHaveLength(2);
++	});
++});

@@ -1,0 +1,4 @@
+src
+pkg
+llama-cpp-cuda
+*.pkg.zst

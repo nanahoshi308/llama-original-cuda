@@ -1,0 +1,991 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 71118b3..0ef2e0d 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2462,6 +2462,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             exit(0);
+         }
+     ));
++    add_opt(common_arg(
++        {"--list-devices-json"},
++        "print list of available devices as JSON and exit",
++        [](common_params &) {
++            ggml_backend_load_all();
++            json devices = json::array();
++            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++                auto * dev = ggml_backend_dev_get(i);
++                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    continue;
++                }
++                size_t free, total;
++                ggml_backend_dev_memory(dev, &free, &total);
++                devices.push_back({
++                    {"name",  ggml_backend_dev_name(dev)},
++                    {"free",  free},
++                    {"total", total},
++                });
++            }
++            printf("%s\n", devices.dump().c_str());
++            exit(0);
++        }
++    ));
+     add_opt(common_arg(
+         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
+         "override tensor buffer type", [](common_params & params, const std::string & value) {
+@@ -3259,6 +3282,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.models_autoload = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
++    add_opt(common_arg(
++        {"--models-gpu-schedule"},
++        {"--no-models-gpu-schedule"},
++        string_format("for router server, enable VRAM-aware GPU placement and eviction for autoloaded models (default: %s)",
++                      params.models_gpu_schedule ? "enabled" : "disabled"),
++        [](common_params & params, bool value) {
++            params.models_gpu_schedule = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_GPU_SCHEDULE"));
++    add_opt(common_arg(
++        {"--models-gpu-margin-mb"}, "N",
++        string_format("for router server, VRAM headroom in MiB to keep free per GPU when scheduling models (default: %d)",
++                      params.models_gpu_margin_mb),
++        [](common_params & params, int value) {
++            params.models_gpu_margin_mb = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_GPU_MARGIN_MB"));
++    add_opt(common_arg(
++        {"--models-gpu-evict-timeout"}, "N",
++        string_format("for router server, max seconds to wait for a busy model to finish before evicting it for VRAM (default: %d)",
++                      params.models_gpu_evict_timeout),
++        [](common_params & params, int value) {
++            params.models_gpu_evict_timeout = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_GPU_EVICT_TIMEOUT"));
+     add_opt(common_arg(
+         {"--jinja"},
+         {"--no-jinja"},
+@@ -4309,9 +4357,9 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
+         [](common_params &, int) { /* unused */ }
+     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+ 
+-    // args.push_back(common_arg(
+-    //     {"pin"},
+-    //     "in server router mode, do not unload this model if models_max is exceeded",
+-    //     [](common_params &) { /* unused */ }
+-    // ).set_preset_only());
++    args.push_back(common_arg(
++        {"pin"},
++        "in server router mode, do not auto-evict this model (models_max or GPU VRAM scheduling)",
++        [](common_params &) { /* unused */ }
++    ).set_env(COMMON_ARG_PRESET_PIN).set_preset_only());
+ }
+diff --git a/common/arg.h b/common/arg.h
+index 54a38b9..b96093d 100644
+--- a/common/arg.h
++++ b/common/arg.h
+@@ -13,6 +13,7 @@
+ // pseudo-env variable to identify preset-only arguments
+ #define COMMON_ARG_PRESET_LOAD_ON_STARTUP "__PRESET_LOAD_ON_STARTUP"
+ #define COMMON_ARG_PRESET_STOP_TIMEOUT    "__PRESET_STOP_TIMEOUT"
++#define COMMON_ARG_PRESET_PIN             "__PRESET_PIN"
+ 
+ //
+ // CLI argument parsing
+diff --git a/common/common.h b/common/common.h
+index 7ed1a98..1c2be12 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -666,6 +666,9 @@ struct common_params {
+     int models_max = 4;                 // maximum number of models to load simultaneously
+     bool models_autoload = true;        // automatically load models when requested via the router server
+     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
++    bool models_gpu_schedule      = false; // enable VRAM-aware GPU placement and eviction for autoloaded models
++    int  models_gpu_margin_mb     = 512;   // VRAM headroom in MiB to keep free per GPU when scheduling models
++    int  models_gpu_evict_timeout = 30;    // max seconds to wait for a busy model to finish before evicting it
+ 
+     bool log_json = false;
+ 
+diff --git a/tools/server/README.md b/tools/server/README.md
+index 365a944..62b48a1 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -216,6 +216,9 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
+ | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
+ | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
++| `--models-gpu-schedule, --no-models-gpu-schedule` | for router server, enable VRAM-aware GPU placement and eviction for autoloaded models (default: disabled)<br/>(env: LLAMA_ARG_MODELS_GPU_SCHEDULE) |
++| `--models-gpu-margin-mb N` | for router server, VRAM headroom in MiB to keep free per GPU when scheduling models (default: 512)<br/>(env: LLAMA_ARG_MODELS_GPU_MARGIN_MB) |
++| `--models-gpu-evict-timeout N` | for router server, max seconds to wait for a busy model to finish before evicting it for VRAM (default: 30)<br/>(env: LLAMA_ARG_MODELS_GPU_EVICT_TIMEOUT) |
+ | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
+ | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
+ | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
+@@ -1687,6 +1690,7 @@ The precedence rule for preset options is as follows:
+ We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
+ - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
+ - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
++- `pin` (boolean): Never auto-evict this model, whether from `--models-max` or from `--models-gpu-schedule`'s VRAM-based eviction
+ 
+ ### Routing requests
+ 
+@@ -1714,6 +1718,23 @@ GET /props?model=ggml-org%2Fgemma-3-4b-it-GGUF%3AQ4_K_M
+ 
+ By default, the model will be loaded automatically if it's not loaded. To disable this, add `--no-models-autoload` when starting the server. Additionally, you can include `?autoload=true|false` in the query param to control this behavior per-request.
+ 
++### GPU-aware scheduling (multi-GPU)
++
++When `--models-gpu-schedule` is enabled, the router picks a GPU for each autoloaded model based on live free VRAM instead of relying on a fixed `--device` per model:
++
++1. Free VRAM per GPU is queried via a short-lived `llama-server --list-devices-json` helper subprocess (the router process itself never touches the GPU).
++2. The model's expected VRAM footprint (weights + KV cache/compute) on each candidate GPU is estimated in-process via `common/fit.h`, the same primitive used by `--fit`.
++3. If a GPU has enough free room (minus `--models-gpu-margin-mb`), the model is placed there.
++4. Otherwise, the router looks for idle (non-busy, non-`pin`ned) models already running on the *same* candidate GPU and evicts them in least-recently-used order until there's enough room. A model that is mid-inference is never evicted while a request is in flight - the eviction waits (bounded by `--models-gpu-evict-timeout`) until that request finishes.
++5. If no GPU has room even after evicting everything evictable, the load fails with an error and the model stays `unloaded`.
++
++Cold loads (through `/models/load` or autoload) are processed one at a time while this is enabled, so two concurrent loads can't both observe the same free VRAM and over-commit a GPU.
++
++Known limitations (v1):
++- Placement is single-GPU-per-model only; a model that doesn't fit on any single GPU is not split across multiple GPUs (no automatic `--tensor-split`).
++- A model with an explicit `--device` (in its preset or on the router's own CLI args) is left untouched - the scheduler never overrides a manual placement.
++- CPU-only models (`-ngl 0`) and multimodal models (mmproj) are exempt from scheduling, since the VRAM estimate doesn't account for a projector's memory usage.
++
+ ### GET `/models`: List available models
+ 
+ Listing all models in cache. The model metadata will also include a field to indicate the status of the model:
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index 7c6bfda..5dae02e 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -8,6 +8,7 @@
+ #include "preset.h"
+ #include "download.h"
+ #include "http.h"
++#include "fit.h"
+ 
+ #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
+ #include <optional>
+@@ -27,6 +28,7 @@
+ #include <filesystem>
+ #include <random>
+ #include <sstream>
++#include <fstream>
+ #include <cstring>
+ 
+ #ifndef _WIN32
+@@ -142,6 +144,9 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
+     preset.unset_option("LLAMA_ARG_MODELS_MAX");
+     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
+     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
++    preset.unset_option("LLAMA_ARG_MODELS_GPU_SCHEDULE");
++    preset.unset_option("LLAMA_ARG_MODELS_GPU_MARGIN_MB");
++    preset.unset_option("LLAMA_ARG_MODELS_GPU_EVICT_TIMEOUT");
+     if (unset_model_args) {
+         preset.unset_option("LLAMA_ARG_MODEL");
+         preset.unset_option("LLAMA_ARG_MMPROJ");
+@@ -723,6 +728,106 @@ static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & ve
+     return result;
+ }
+ 
++// parses the flat JSON array produced by --list-devices-json (and by the
++// LLAMA_TEST_FAKE_GPUS test override, which uses the same shape)
++static std::vector<gpu_device_info> parse_gpu_devices_json(const std::string & text) {
++    std::vector<gpu_device_info> result;
++    json devices = json::parse(text);
++    for (const auto & d : devices) {
++        gpu_device_info info;
++        info.name  = d.value("name", "");
++        info.free  = d.value("free",  (int64_t) 0);
++        info.total = d.value("total", (int64_t) 0);
++        if (!info.name.empty()) {
++            result.push_back(info);
++        }
++    }
++    return result;
++}
++
++// live free/total VRAM per GPU, queried via a short-lived "<bin_path> --list-devices-json"
++// helper subprocess so the long-running router process never has to touch the GPU itself
++// (see the "router server never loads a model and must not touch the GPU" note in server.cpp)
++static std::vector<gpu_device_info> query_gpu_devices(const std::string & bin_path) {
++    // file-based override re-reads on every call, unlike a plain env var (fixed for the whole
++    // process lifetime) - lets tests simulate live free VRAM changing between load attempts
++    // without restarting the router
++    if (const char * fake_file = std::getenv("LLAMA_TEST_FAKE_GPUS_FILE")) {
++        std::ifstream f(fake_file);
++        if (f) {
++            std::stringstream ss;
++            ss << f.rdbuf();
++            try {
++                return parse_gpu_devices_json(ss.str());
++            } catch (const std::exception & e) {
++                SRV_WRN("query_gpu_devices: failed to parse LLAMA_TEST_FAKE_GPUS_FILE: %s\n", e.what());
++                return {};
++            }
++        }
++    }
++
++    if (const char * fake = std::getenv("LLAMA_TEST_FAKE_GPUS")) {
++        try {
++            return parse_gpu_devices_json(fake);
++        } catch (const std::exception & e) {
++            SRV_WRN("query_gpu_devices: failed to parse LLAMA_TEST_FAKE_GPUS: %s\n", e.what());
++            return {};
++        }
++    }
++
++    if (bin_path.empty()) {
++        return {};
++    }
++
++    std::vector<std::string> cmd = { bin_path, "--list-devices-json" };
++    std::vector<char *> argv = to_char_ptr_array(cmd);
++
++    subprocess_s proc;
++    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr | subprocess_option_inherit_environment;
++    if (subprocess_create(argv.data(), options, &proc) != 0) {
++        SRV_WRN("query_gpu_devices: failed to spawn '%s --list-devices-json'\n", bin_path.c_str());
++        return {};
++    }
++
++    // watchdog: force-kill the helper if it doesn't exit within a few seconds
++    std::atomic<bool> done{false};
++    std::thread watchdog([&proc, &done]() {
++        for (int i = 0; i < 50 && !done.load(std::memory_order_acquire); ++i) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++        if (!done.load(std::memory_order_acquire)) {
++            subprocess_terminate(&proc);
++        }
++    });
++
++    std::string output;
++    FILE * out = subprocess_stdout(&proc);
++    if (out) {
++        std::vector<char> buf(64 * 1024);
++        while (fgets(buf.data(), (int) buf.size(), out) != nullptr) {
++            output += buf.data();
++        }
++    }
++
++    int exit_code = 0;
++    subprocess_join(&proc, &exit_code);
++    done.store(true, std::memory_order_release);
++    watchdog.join();
++    subprocess_destroy(&proc);
++
++    if (exit_code != 0) {
++        SRV_WRN("query_gpu_devices: '%s --list-devices-json' exited with code %d\n", bin_path.c_str(), exit_code);
++        return {};
++    }
++
++    try {
++        return parse_gpu_devices_json(output);
++    } catch (const std::exception & e) {
++        SRV_WRN("query_gpu_devices: failed to parse device list JSON: %s\n", e.what());
++        return {};
++    }
++}
++
+ std::vector<server_model_meta> server_models::get_all_meta() {
+     std::unique_lock<std::mutex> lk(mutex);
+     if (need_reload) {
+@@ -739,6 +844,222 @@ std::vector<server_model_meta> server_models::get_all_meta() {
+     return result;
+ }
+ 
++std::shared_ptr<std::atomic<int>> server_models::get_busy_counter(const std::string & name) {
++    std::lock_guard<std::mutex> lk(mutex);
++    auto it = mapping.find(name);
++    if (it != mapping.end()) {
++        return it->second.busy_count;
++    }
++    for (const auto & [key, inst] : mapping) {
++        if (inst.meta.aliases.count(name)) {
++            return inst.busy_count;
++        }
++    }
++    return nullptr;
++}
++
++std::optional<int64_t> server_models::estimate_model_vram(const server_model_meta & meta, const std::string & device_name) {
++    if (const char * fake = std::getenv("LLAMA_TEST_FAKE_MODEL_VRAM")) {
++        try {
++            json vram_map = json::parse(fake);
++            if (vram_map.contains(device_name)) {
++                return vram_map[device_name].get<int64_t>();
++            }
++        } catch (const std::exception & e) {
++            SRV_WRN("estimate_model_vram: failed to parse LLAMA_TEST_FAKE_MODEL_VRAM: %s\n", e.what());
++        }
++        return std::nullopt;
++    }
++
++    try {
++        // apply_to_params(params, handled_keys) treats a non-empty handled_keys as an
++        // *inclusion* filter (see its impl in preset.cpp) - passing just the model/mmproj/
++        // hf-repo keys here, as this used to, meant ctx-size/cache-type-k/cache-type-v/
++        // flash-attn/etc. were silently NOT applied, so the estimate below was computed
++        // against common_params' defaults (n_ctx=0 -> full n_ctx_train, f16 KV cache)
++        // instead of the model's actual configured footprint - wildly overestimating VRAM
++        // need for any model that quantizes its KV cache or caps its context below training
++        // length (i.e. almost every real preset). Apply the whole preset normally instead;
++        // common_models_handler_apply() below still safely resolves hf-repo/mmproj-auto
++        // refs afterward (offline=true so it only maps to an already-cached local path,
++        // never downloads) and is a no-op when the preset already gives a direct model path.
++        common_params params;
++        meta.preset.apply_to_params(params);
++        params.offline = true;
++        common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
++        common_models_handler_apply(handler, params);
++
++        auto * dev = ggml_backend_dev_by_name(device_name.c_str());
++        if (!dev || params.model.path.empty()) {
++            return std::nullopt;
++        }
++
++        llama_model_params   mparams = common_model_params_to_llama(params);
++        llama_context_params cparams = common_context_params_to_llama(params);
++
++        // probe "this model alone on `device_name`": must explicitly restrict mparams.devices,
++        // since leaving it null auto-enumerates every GPU regardless of split_mode, and main_gpu
++        // would then index into that auto-list rather than a specific device
++        std::vector<ggml_backend_dev_t> devices_arr = { dev, nullptr };
++        mparams.devices      = devices_arr.data();
++        mparams.split_mode   = LLAMA_SPLIT_MODE_NONE;
++        mparams.main_gpu     = 0; // index within devices_arr
++        mparams.n_gpu_layers = -2; // "all"
++
++        std::vector<ggml_backend_dev_t> devs;
++        uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
++
++        // common_get_device_memory_data() is not thread-safe (it temporarily swaps the global
++        // llama logger callback) and transiently constructs a trial model+context, which
++        // deliberately touches the GPU in this otherwise GPU-free router process - a scoped,
++        // accepted exception to the "router never touches the GPU" rule (see server.cpp)
++        std::lock_guard<std::mutex> fit_lk(fit_mutex);
++        auto dmd = common_get_device_memory_data(
++            params.model.path.c_str(), &mparams, &cparams,
++            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
++        if (dmd.empty()) {
++            return std::nullopt;
++        }
++        return (int64_t) (dmd[0].model + dmd[0].context + dmd[0].compute);
++    } catch (const std::exception & e) {
++        SRV_WRN("estimate_model_vram: failed for model '%s' on device '%s': %s\n",
++                meta.name.c_str(), device_name.c_str(), e.what());
++        return std::nullopt;
++    }
++}
++
++void server_models::place_model(server_model_meta & meta) {
++    if (!base_params.models_gpu_schedule) {
++        return;
++    }
++
++    // manual placement always wins - never second-guess an explicit --device pin
++    std::string existing_device;
++    if (meta.preset.get_option("LLAMA_ARG_DEVICE", existing_device) && !existing_device.empty()) {
++        return;
++    }
++
++    // CPU-only models are exempt, they have no VRAM cost
++    std::string ngl_str;
++    if (meta.preset.get_option("LLAMA_ARG_N_GPU_LAYERS", ngl_str) && ngl_str == "0") {
++        return;
++    }
++
++    // v1 limitation: the estimate below only covers the base LLM, not a vision/audio projector
++    if (meta.multimodal.inp_vision || meta.multimodal.inp_audio) {
++        return;
++    }
++
++    auto devices = query_gpu_devices(bin_path);
++    if (devices.empty()) {
++        SRV_WRN("place_model: no GPU device info available, falling back to default placement for '%s'\n", meta.name.c_str());
++        return;
++    }
++
++    std::map<std::string, int64_t> candidate;
++    for (const auto & dev : devices) {
++        auto est = estimate_model_vram(meta, dev.name);
++        if (est.has_value()) {
++            candidate[dev.name] = *est;
++        }
++    }
++    if (candidate.empty()) {
++        throw std::runtime_error("failed to estimate VRAM for model '" + meta.name + "' on any device");
++    }
++
++    const int64_t margin = (int64_t) base_params.models_gpu_margin_mb * 1024 * 1024;
++
++    // 1st pass: direct fit, first candidate device (declaration order) with enough headroom wins
++    for (const auto & dev : devices) {
++        auto it = candidate.find(dev.name);
++        if (it == candidate.end()) {
++            continue;
++        }
++        if (dev.free - margin >= it->second) {
++            meta.gpu_device = dev.name;
++            meta.vram_bytes = it->second;
++            meta.preset.set_option(ctx_preset, "LLAMA_ARG_DEVICE", dev.name);
++            return;
++        }
++    }
++
++    // 2nd pass: same-device eviction, LRU-first among idle (non-pinned) models
++    struct evict_candidate {
++        std::string name;
++        int64_t vram_bytes;
++        int64_t last_used;
++    };
++
++    for (const auto & dev : devices) {
++        auto it = candidate.find(dev.name);
++        if (it == candidate.end()) {
++            continue;
++        }
++        const int64_t needed = it->second;
++
++        std::vector<evict_candidate> same_device;
++        {
++            std::lock_guard<std::mutex> lk(mutex);
++            for (const auto & [n, inst] : mapping) {
++                if (inst.meta.gpu_device != dev.name || !inst.meta.is_running()) {
++                    continue;
++                }
++                std::string pin_val;
++                if (inst.meta.preset.get_option(COMMON_ARG_PRESET_PIN, pin_val) && common_arg_utils::is_truthy(pin_val)) {
++                    continue; // never auto-evict a pinned model
++                }
++                same_device.push_back({ n, inst.meta.vram_bytes, inst.meta.last_used });
++            }
++        }
++        std::sort(same_device.begin(), same_device.end(), [](const evict_candidate & a, const evict_candidate & b) {
++            return a.last_used < b.last_used; // LRU first
++        });
++
++        int64_t projected_free = dev.free;
++        std::vector<std::string> to_evict;
++        for (const auto & c : same_device) {
++            if (projected_free - margin >= needed) {
++                break;
++            }
++            projected_free += c.vram_bytes;
++            to_evict.push_back(c.name);
++        }
++        if (projected_free - margin < needed) {
++            continue; // even evicting everything on this device isn't enough, try next GPU
++        }
++
++        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(base_params.models_gpu_evict_timeout);
++        for (const auto & evict_name : to_evict) {
++            auto busy = get_busy_counter(evict_name);
++            if (busy) {
++                std::unique_lock<std::mutex> lk(mutex);
++                bool ok = cv.wait_until(lk, deadline, [&busy]() {
++                    return busy->load(std::memory_order_acquire) == 0;
++                });
++                if (!ok) {
++                    throw std::runtime_error("model '" + evict_name + "' is busy, could not evict to make room for '" + meta.name + "'");
++                }
++            }
++            SRV_INF("evicting model '%s' on device %s to make room for '%s'\n", evict_name.c_str(), dev.name.c_str(), meta.name.c_str());
++            unload(evict_name);
++            {
++                std::unique_lock<std::mutex> lk(mutex);
++                cv.wait(lk, [this, &evict_name]() {
++                    auto it2 = mapping.find(evict_name);
++                    return it2 == mapping.end() || it2->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
++                });
++            }
++        }
++
++        meta.gpu_device = dev.name;
++        meta.vram_bytes = needed;
++        meta.preset.set_option(ctx_preset, "LLAMA_ARG_DEVICE", dev.name);
++        return;
++    }
++
++    throw std::runtime_error("model '" + meta.name + "' does not fit on any GPU even after evicting all eligible models");
++}
++
+ void server_models::unload_lru() {
+     if (base_params.models_max <= 0) {
+         return; // no limit
+@@ -777,11 +1098,25 @@ void server_models::load(const std::string & name) {
+ }
+ 
+ void server_models::load(const std::string & name, const load_options & opts) {
++    // serializes the whole GPU placement decision (and, further below, the wait until this
++    // model finishes loading) so concurrent cold-loads can't both observe the same free VRAM
++    // and over-commit a device - see load_schedule_mutex's declaration for details
++    std::unique_lock<std::mutex> schedule_lk(load_schedule_mutex, std::defer_lock);
++
+     if (!opts.custom_meta.has_value()) {
+         if (!has_model(name)) {
+             throw std::runtime_error("model name=" + name + " is not found");
+         }
+         unload_lru();
++
++        if (base_params.models_gpu_schedule) {
++            schedule_lk.lock();
++            auto meta_for_placement = get_meta(name);
++            if (meta_for_placement.has_value() && meta_for_placement->status == SERVER_MODEL_STATUS_UNLOADED) {
++                place_model(*meta_for_placement);
++                update_meta(name, *meta_for_placement);
++            }
++        }
+     }
+ 
+     std::unique_lock<std::mutex> lk(mutex);
+@@ -977,6 +1312,16 @@ void server_models::load(const std::string & name, const load_options & opts) {
+ 
+     mapping[name] = std::move(inst);
+     cv.notify_all();
++    lk.unlock();
++
++    if (schedule_lk.owns_lock()) {
++        // block until this model finishes loading (or fails) before releasing
++        // load_schedule_mutex, so the next queued cold-load's GPU survey observes this
++        // model's actually-committed VRAM usage rather than a stale pre-load reading
++        wait(name, [](const server_model_meta & m) {
++            return m.status != SERVER_MODEL_STATUS_LOADING;
++        });
++    }
+ }
+ 
+ void server_models::unload(const std::string & name) {
+@@ -1044,6 +1389,16 @@ void server_models::update_status(const std::string & name, const update_status_
+         if (!args.progress.is_null()) {
+             meta.progress = args.progress;
+         }
++        // a device chosen by the GPU scheduler must not masquerade as a manual --device
++        // pin on the next load: place_model()'s "never second-guess a manual pin" check
++        // reads this same LLAMA_ARG_DEVICE option, so if we left it set here, the model
++        // would be stuck retrying (and potentially OOM'ing on) whatever GPU it happened
++        // to land on last time, even after that GPU fills up and another one frees up
++        if (args.status == SERVER_MODEL_STATUS_UNLOADED && !meta.gpu_device.empty()) {
++            meta.preset.unset_option("LLAMA_ARG_DEVICE");
++            meta.gpu_device.clear();
++            meta.vram_bytes = 0;
++        }
+     }
+     // broadcast status change to SSE
+     {
+@@ -1227,6 +1582,12 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
+     if (!req.query_string.empty()) {
+         proxy_path += '?' + req.query_string;
+     }
++    // mark this instance busy for the full duration of the streamed response, so the GPU
++    // scheduler's eviction logic never kills a model that is mid-inference
++    auto busy = get_busy_counter(name);
++    if (busy) {
++        busy->fetch_add(1, std::memory_order_acq_rel);
++    }
+     auto proxy = std::make_unique<server_http_proxy>(
+             method,
+             "http",
+@@ -1240,6 +1601,16 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
+             base_params.timeout_read,
+             base_params.timeout_write
+             );
++    if (busy) {
++        auto prev_cleanup = proxy->cleanup;
++        proxy->cleanup = [this, busy, prev_cleanup]() {
++            if (prev_cleanup) {
++                prev_cleanup();
++            }
++            busy->fetch_sub(1, std::memory_order_acq_rel);
++            cv.notify_all();
++        };
++    }
+     return proxy;
+ }
+ 
+diff --git a/tools/server/server-models.h b/tools/server/server-models.h
+index 62bed87..e22c358 100644
+--- a/tools/server/server-models.h
++++ b/tools/server/server-models.h
+@@ -7,6 +7,7 @@
+ #include "server-http.h"
+ #include "server-queue.h"
+ 
++#include <atomic>
+ #include <mutex>
+ #include <condition_variable>
+ #include <functional>
+@@ -84,6 +85,8 @@ struct server_model_meta {
+     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
+     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
+     mtmd_caps multimodal; // multimodal capabilities
++    std::string gpu_device; // GPU device assigned by the VRAM scheduler, e.g. "CUDA0"; empty if CPU-only, unplaced, or manually pinned
++    int64_t vram_bytes = 0; // estimated model+context+compute bytes reserved on gpu_device
+     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
+ 
+     bool is_ready() const {
+@@ -105,6 +108,13 @@ struct server_model_meta {
+ struct server_models_routes;
+ struct server_subproc; // defined in server-models.cpp
+ 
++// live free/total VRAM for one GPU device, as reported by --list-devices-json
++struct gpu_device_info {
++    std::string name;
++    int64_t free = 0;
++    int64_t total = 0;
++};
++
+ struct server_models {
+     friend struct server_models_routes;
+ 
+@@ -113,6 +123,9 @@ private:
+         std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
+         std::thread th;
+         server_model_meta meta;
++        // in-flight request count for this instance; shared_ptr so proxy_request()'s cleanup
++        // callback can still decrement it after the instance may have been replaced in mapping
++        std::shared_ptr<std::atomic<int>> busy_count = std::make_shared<std::atomic<int>>(0);
+     };
+ 
+     std::mutex mutex;
+@@ -174,11 +187,30 @@ private:
+     std::vector<std::string> base_env;
+     common_preset base_preset; // base preset from llama-server CLI args
+ 
++    // serializes calls into common/fit.h, which is documented not-thread-safe (it swaps the
++    // global llama logger callback while running a trial model+context load)
++    std::mutex fit_mutex;
++
++    // serializes the whole GPU placement-decision + spawn sequence in load(), so concurrent
++    // cold-loads can't both observe the same free VRAM and over-commit a device (TOCTOU)
++    std::mutex load_schedule_mutex;
++
+     void update_meta(const std::string & name, const server_model_meta & meta);
+ 
+     // unload least recently used models if the limit is reached
+     void unload_lru();
+ 
++    // estimate model+context+compute bytes needed to place `meta`'s model entirely on
++    // `device_name` (e.g. "CUDA0"); returns nullopt on failure (unreadable GGUF, etc.)
++    // deliberately touches the GPU in-process for the duration of the trial load (see
++    // estimate_model_vram()'s definition for why this is an accepted, scoped exception)
++    std::optional<int64_t> estimate_model_vram(const server_model_meta & meta, const std::string & device_name);
++
++    // decide GPU placement for a model about to be loaded, evicting idle same-device models
++    // (LRU order) if needed; no-op if GPU scheduling is disabled or the model is manually
++    // pinned to a device / CPU-only / multimodal. Throws if no device has room.
++    void place_model(server_model_meta & meta);
++
+     // not thread-safe, caller must hold mutex
+     void add_model(server_model_meta && meta);
+ 
+@@ -251,6 +283,9 @@ public:
+     // proxy an HTTP request to the model instance
+     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+ 
++    // return the busy (in-flight request) counter for a running instance, or nullptr if not found (thread-safe)
++    std::shared_ptr<std::atomic<int>> get_busy_counter(const std::string & name);
++
+     // handle message sent from server_child::notify_to_router()
+     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
+     // this function is not thread-safe, must be called from instance's monitoring thread
+diff --git a/tools/server/tests/unit/test_router_gpu_schedule.py b/tools/server/tests/unit/test_router_gpu_schedule.py
+new file mode 100644
+index 0000000..e0df8b0
+--- /dev/null
++++ b/tools/server/tests/unit/test_router_gpu_schedule.py
+@@ -0,0 +1,269 @@
++import json
++import threading
++import urllib.request
++
++import pytest
++from utils import *
++
++server: ServerProcess
++
++MODEL_A = "ggml-org/tinygemma3-GGUF:Q8_0"
++MODEL_B = "ggml-org/test-model-stories260K:F32"
++
++GB = 1024 * 1024 * 1024
++
++
++@pytest.fixture(autouse=True)
++def create_server():
++    global server
++    server = ServerPreset.router()
++    server.models_gpu_schedule = True
++
++
++def _write_fake_gpus(path: str, free_bytes: int, total_bytes: int = 8 * GB, name: str = "CUDA0") -> None:
++    with open(path, "w") as f:
++        json.dump([{"name": name, "free": free_bytes, "total": total_bytes}], f)
++
++
++def _write_fake_gpus_multi(path: str, gpus: list[dict]) -> None:
++    with open(path, "w") as f:
++        json.dump(gpus, f)
++
++
++def _get_model_status(model_id: str) -> str:
++    res = server.make_request("GET", "/models")
++    assert res.status_code == 200
++    for item in res.body.get("data", []):
++        if item.get("id") == model_id or item.get("model") == model_id:
++            return item["status"]["value"]
++    raise AssertionError(f"Model {model_id} not found in /models response")
++
++
++def _get_model_device(model_id: str) -> str | None:
++    """Read back the --device this model instance was actually spawned with."""
++    res = server.make_request("GET", "/models")
++    assert res.status_code == 200
++    for item in res.body.get("data", []):
++        if item.get("id") == model_id or item.get("model") == model_id:
++            args = item["status"].get("args", [])
++            if "--device" in args:
++                return args[args.index("--device") + 1]
++            return None
++    raise AssertionError(f"Model {model_id} not found in /models response")
++
++
++def _wait_for_model_status(model_id: str, desired: set[str], timeout: int = 60) -> str:
++    deadline = time.time() + timeout
++    last_status = None
++    while time.time() < deadline:
++        last_status = _get_model_status(model_id)
++        if last_status in desired:
++            return last_status
++        time.sleep(1)
++    raise AssertionError(
++        f"Timed out waiting for {model_id} to reach {desired}, last status: {last_status}"
++    )
++
++
++def _load_model_and_wait(model_id: str, timeout: int = 60) -> None:
++    load_res = server.make_request("POST", "/models/load", data={"model": model_id})
++    assert load_res.status_code == 200
++    assert isinstance(load_res.body, dict)
++    assert load_res.body.get("success") is True
++    _wait_for_model_status(model_id, {"loaded"}, timeout=timeout)
++
++
++def test_router_gpu_schedule_loads_when_room(tmp_path, monkeypatch):
++    """A model loads normally when the (fake) GPU reports plenty of free VRAM."""
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus(str(gpus_file), free_bytes=8 * GB)
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))
++    monkeypatch.setenv("LLAMA_TEST_FAKE_MODEL_VRAM", json.dumps({"CUDA0": 2 * GB}))
++
++    server.start()
++    _load_model_and_wait(MODEL_A, timeout=120)
++    assert _get_model_status(MODEL_A) == "loaded"
++
++
++def test_router_gpu_schedule_evicts_lru_same_device(tmp_path, monkeypatch):
++    """When the fake GPU no longer has room, loading a 2nd model evicts the idle 1st one."""
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus(str(gpus_file), free_bytes=8 * GB)
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))
++    monkeypatch.setenv("LLAMA_TEST_FAKE_MODEL_VRAM", json.dumps({"CUDA0": 2 * GB}))
++
++    server.start()
++    _load_model_and_wait(MODEL_A, timeout=120)
++    assert _get_model_status(MODEL_A) == "loaded"
++
++    # simulate the GPU becoming nearly full (e.g. from real usage growing) - not enough
++    # room left for a fresh 2 GiB model, but enough once idle model A is evicted
++    _write_fake_gpus(str(gpus_file), free_bytes=int(2.2 * GB))
++
++    _load_model_and_wait(MODEL_B, timeout=120)
++    assert _get_model_status(MODEL_B) == "loaded"
++    assert _get_model_status(MODEL_A) == "unloaded"
++
++
++def test_router_gpu_schedule_waits_for_busy_model_before_evicting(tmp_path, monkeypatch):
++    """A model that is mid-inference must finish its response before being evicted."""
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus(str(gpus_file), free_bytes=8 * GB)
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))
++    monkeypatch.setenv("LLAMA_TEST_FAKE_MODEL_VRAM", json.dumps({"CUDA0": 2 * GB}))
++
++    server.start()
++    _load_model_and_wait(MODEL_A, timeout=120)
++
++    stream_result: dict = {"content": "", "error": None}
++
++    def _stream_a():
++        try:
++            for data in server.make_stream_request("POST", "/chat/completions", data={
++                "model": MODEL_A,
++                "max_tokens": 400,
++                "messages": [{"role": "user", "content": "tell me a long story"}],
++                "stream": True,
++            }):
++                if data["choices"]:
++                    stream_result["content"] += data["choices"][0]["delta"].get("content") or ""
++        except Exception as e:
++            stream_result["error"] = e
++
++    stream_thread = threading.Thread(target=_stream_a, daemon=True)
++    stream_thread.start()
++    time.sleep(0.5)  # give the stream time to actually start before we try to evict it
++
++    # now make the GPU appear full, forcing model B's load to evict the (busy) model A;
++    # if the scheduler killed A mid-generation instead of waiting, its stream would break
++    _write_fake_gpus(str(gpus_file), free_bytes=int(2.2 * GB))
++    _load_model_and_wait(MODEL_B, timeout=120)
++
++    stream_thread.join(timeout=60)
++    assert stream_result["error"] is None, f"model A's stream failed: {stream_result['error']}"
++    assert len(stream_result["content"]) > 0
++    assert _get_model_status(MODEL_B) == "loaded"
++    assert _get_model_status(MODEL_A) == "unloaded"
++
++
++def test_router_gpu_schedule_fails_when_nothing_fits(tmp_path, monkeypatch):
++    """Loading fails with a clear error when the model doesn't fit on any GPU, even empty."""
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus(str(gpus_file), free_bytes=1 * GB)  # too small for the model below
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))
++    monkeypatch.setenv("LLAMA_TEST_FAKE_MODEL_VRAM", json.dumps({"CUDA0": 4 * GB}))
++
++    server.start()
++    load_res = server.make_request("POST", "/models/load", data={"model": MODEL_A})
++    assert load_res.status_code >= 400
++    assert _get_model_status(MODEL_A) == "unloaded"
++
++
++def test_router_gpu_schedule_reevaluates_placement_after_unload(tmp_path, monkeypatch):
++    """A model previously placed on one GPU must be re-surveyed on its next load, not
++    stuck retrying the same device forever.
++
++    Regression test: place_model() used to persist its own placement decision into the
++    model's LLAMA_ARG_DEVICE preset option, which is the *same* option it reads to detect
++    a user's manual --device pin ("never second-guess a manual pin"). After an unload,
++    the next load would see that leftover option, treat it as a manual pin, skip the VRAM
++    survey entirely, and retry the same (now full) device - even if another GPU was free.
++    """
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus_multi(str(gpus_file), [
++        {"name": "CUDA0", "free": 8 * GB, "total": 8 * GB},
++        {"name": "CUDA1", "free": 8 * GB, "total": 8 * GB},
++    ])
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))
++    monkeypatch.setenv("LLAMA_TEST_FAKE_MODEL_VRAM", json.dumps({"CUDA0": 2 * GB, "CUDA1": 2 * GB}))
++
++    # MODEL_A (tinygemma3) is multimodal, which place_model() exempts from scheduling
++    # entirely (see the "v1 limitation" check for meta.multimodal) - it never gets a
++    # --device assigned, so it can't exercise this code path. MODEL_B is text-only.
++    server.start()
++    _load_model_and_wait(MODEL_B, timeout=120)
++    assert _get_model_status(MODEL_B) == "loaded"
++    assert _get_model_device(MODEL_B) == "CUDA0"
++
++    unload_res = server.make_request("POST", "/models/unload", data={"model": MODEL_B})
++    assert unload_res.status_code == 200
++    _wait_for_model_status(MODEL_B, {"unloaded"}, timeout=60)
++
++    # CUDA0 (where model B landed the first time) is now full; only CUDA1 has room.
++    # The real GPU underneath still has plenty of room for this tiny test model even
++    # if the router (buggily) keeps re-targeting CUDA0, so a bare status=="loaded"
++    # check can't tell a correct re-placement apart from a stale, never-reconsidered
++    # one - we have to check *which* device it actually landed on.
++    _write_fake_gpus_multi(str(gpus_file), [
++        {"name": "CUDA0", "free": int(0.1 * GB), "total": 8 * GB},
++        {"name": "CUDA1", "free": 8 * GB, "total": 8 * GB},
++    ])
++
++    _load_model_and_wait(MODEL_B, timeout=120)
++    assert _get_model_status(MODEL_B) == "loaded"
++    assert _get_model_device(MODEL_B) == "CUDA1"
++
++
++def test_router_gpu_schedule_estimate_honors_ctx_size(tmp_path, monkeypatch):
++    """The VRAM estimate must reflect the model's actual configured ctx-size (and, by the
++    same code path, cache-type-k/v, flash-attn, etc.), not common_params' defaults (ctx-size
++    unset -> full native training context, f16 KV cache).
++
++    Regression test: estimate_model_vram() called preset.apply_to_params() with a
++    restrictive allow-list (only the model/mmproj/hf-repo resolution keys), and that
++    allow-list is an *inclusion* filter - every other preset option, including ctx-size,
++    was silently never applied. Two presets for the exact same model differing only in
++    ctx-size (16 vs. 16,777,216) were therefore estimated identically, so the absurdly
++    large one was wrongly accepted by the scheduler instead of being rejected up front.
++    """
++    gpus_file = tmp_path / "gpus.json"
++    _write_fake_gpus(str(gpus_file), free_bytes=1 * GB)  # the real GPU has plenty of room;
++    monkeypatch.setenv("LLAMA_TEST_FAKE_GPUS_FILE", str(gpus_file))  # this only caps the *decision*
++    # deliberately NOT setting LLAMA_TEST_FAKE_MODEL_VRAM - the real estimator must run
++
++    # a direct local model path (rather than hf-repo) keeps this test independent of the
++    # cache/download layer - estimate_model_vram() only needs a real, readable GGUF file
++    model_path = tmp_path / "stories260K.gguf"
++    urllib.request.urlretrieve(
++        "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf",
++        model_path,
++    )
++
++    # -fit off: --fit is on by default and would otherwise auto-shrink ctx-size to
++    # whatever fits during both the real load AND (per the patch's own docs) the VRAM
++    # estimate itself, defeating this test by making even an absurd ctx-size "fit"
++    presets_ini = tmp_path / "presets.ini"
++    presets_ini.write_text(
++        f"[story-small-ctx]\n"
++        f"model = {model_path}\n"
++        f"ctx-size = 16\n"
++        f"n-gpu-layers = 99\n"
++        f"fit = false\n"
++        f"\n"
++        f"[story-big-ctx]\n"
++        f"model = {model_path}\n"
++        f"ctx-size = 16777216\n"
++        f"n-gpu-layers = 99\n"
++        f"fit = false\n"
++    )
++    server.models_preset = str(presets_ini)
++    server.server_port = 8091  # avoid colliding with a real llama-router that may be running on 8080
++    # ServerPreset.router() sets a router-level --ctx-size 1024, which (per the docs'
++    # preset precedence rule) overrides any per-model ctx-size in our presets - clear it
++    server.n_ctx = None
++    server.start()
++
++    _load_model_and_wait("story-small-ctx", timeout=120)
++    assert _get_model_status("story-small-ctx") == "loaded"
++
++    unload_res = server.make_request("POST", "/models/unload", data={"model": "story-small-ctx"})
++    assert unload_res.status_code == 200
++    _wait_for_model_status("story-small-ctx", {"unloaded"}, timeout=60)
++
++    # same 1 GiB fake budget as before; only ctx-size differs, by six orders of magnitude
++    load_res = server.make_request("POST", "/models/load", data={"model": "story-big-ctx"})
++    assert load_res.status_code >= 400, (
++        "story-big-ctx was accepted despite needing a ~16M-token KV cache - "
++        "the estimate is ignoring ctx-size again"
++    )
++    assert _get_model_status("story-big-ctx") == "unloaded"
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index 8c0de38..0c9d328 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -93,6 +93,9 @@ class ServerProcess:
+     models_max: int | None = None
+     models_preset: str | None = None
+     no_models_autoload: bool | None = None
++    models_gpu_schedule: bool | None = None
++    models_gpu_margin_mb: int | None = None
++    models_gpu_evict_timeout: int | None = None
+     lora_files: List[str] | None = None
+     enable_ctx_shift: int | None = False
+     spec_draft_n_min: int | None = None
+@@ -233,6 +236,12 @@ class ServerProcess:
+             server_args.append("--no-ui")
+         if self.no_models_autoload:
+             server_args.append("--no-models-autoload")
++        if self.models_gpu_schedule:
++            server_args.append("--models-gpu-schedule")
++        if self.models_gpu_margin_mb is not None:
++            server_args.extend(["--models-gpu-margin-mb", self.models_gpu_margin_mb])
++        if self.models_gpu_evict_timeout is not None:
++            server_args.extend(["--models-gpu-evict-timeout", self.models_gpu_evict_timeout])
+         if self.jinja:
+             server_args.append("--jinja")
+         else:
